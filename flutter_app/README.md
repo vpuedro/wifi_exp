@@ -1,0 +1,42 @@
+# bettercap-wifi — app Flutter
+
+Petite application Flutter qui pilote le backend WiFi (`../`) via son **API HTTP**.
+
+## Ce qu'elle fait
+
+- **Points d'accès** : liste live des APs (ESSID, BSSID, canal, RSSI coloré, chiffrement,
+  nombre de clients, présence de handshake, WPS). Dépliage → clients associés + actions.
+- **Actions** (envoyées comme commandes à `POST /api/session`) :
+  - Toggle **Recon ON/OFF** (`wifi.recon on|off`)
+  - Réglage des **canaux** / hopping (`wifi.recon.channel …`)
+  - Par AP : **Deauth** (`wifi.deauth <bssid>`), **Assoc/PMKID** (`wifi.assoc <bssid>`), **WPS** (`wifi.show.wps`)
+  - Par client : **Deauth** ciblé
+- **Événements** : flux `/api/events` (nouveaux APs/clients, handshakes, deauths…), avec purge.
+- **Console** : envoi de n'importe quelle commande `wifi.*` + raccourcis.
+- **Réglages** : URL du backend + jeton API (`X-Api-Token`).
+
+Aucune dépendance externe : le client HTTP utilise `dart:io` (sockets bruts).
+Cibles : **desktop (macOS/Linux/Windows) et mobile**. Pas le web (`dart:io` non supporté).
+
+## Lancer
+
+1. Démarrer le backend (root requis pour la capture monitor) :
+   ```bash
+   cd ..
+   sudo ./bettercap-wifi -iface wlan0 -api-address 127.0.0.1:8081
+   # avec jeton : -api-token monsecret
+   ```
+2. Lancer l'app :
+   ```bash
+   flutter run -d macos      # ou: flutter run -d <device>
+   ```
+3. Dans l'app : ⚙️ → régler l'URL (`http://127.0.0.1:8081`) et le jeton si besoin.
+
+> Depuis un mobile, mets l'IP de la machine qui fait tourner le backend
+> (ex. `http://192.168.1.10:8081`) et démarre le backend avec
+> `-api-address 0.0.0.0:8081`.
+
+## Structure
+
+- `lib/api_client.dart` — client HTTP + modèles (`AccessPoint`, `WifiClient`, `ApEvent`, `SessionInfo`).
+- `lib/main.dart` — UI (Material 3 sombre) : barre de contrôle + onglets APs / Événements / Console.
