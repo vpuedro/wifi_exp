@@ -108,3 +108,35 @@ func TestTokenAuth(t *testing.T) {
 		t.Fatalf("token status = %d, want 200", w.Code)
 	}
 }
+
+func TestGetHandshakes(t *testing.T) {
+	sess := mockSession(t)
+	sess.Env.Set("wifi.handshakes.file", "/tmp/shakes.pcap")
+	// an AP flagged with key material must appear in /api/handshakes
+	ap, _ := sess.WiFi.AddIfNew("CorpNet", "de:ad:be:ef:00:01", 2437, -42)
+	ap.WithKeyMaterial(true)
+
+	srv := New(sess, "127.0.0.1:0", "")
+	w := do(t, srv.Handler(), http.MethodGet, "/api/handshakes", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var out map[string]dynamic
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if out["file"] != "/tmp/shakes.pcap" {
+		t.Fatalf("file = %v, want /tmp/shakes.pcap", out["file"])
+	}
+	list, ok := out["handshakes"].([]dynamic)
+	if !ok || len(list) != 1 {
+		t.Fatalf("handshakes = %v, want 1 record", out["handshakes"])
+	}
+	rec := list[0].(map[string]dynamic)
+	if rec["ap_essid"] != "CorpNet" || rec["ap_key_material"] != true {
+		t.Fatalf("unexpected record: %v", rec)
+	}
+}
+
+// dynamic is a shorthand for arbitrary decoded JSON.
+type dynamic = interface{}

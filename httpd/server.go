@@ -30,6 +30,7 @@ func New(sess *api.Session, address, token string) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/session", s.auth(s.handleSession))
 	mux.HandleFunc("/api/wifi", s.auth(s.handleWiFi))
+	mux.HandleFunc("/api/handshakes", s.auth(s.handleHandshakes))
 	mux.HandleFunc("/api/events", s.auth(s.handleEvents))
 	mux.HandleFunc("/api/env", s.auth(s.handleEnv))
 
@@ -116,6 +117,86 @@ func (s *Server) handleWiFi(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sess.WiFi)
+}
+
+// handshakeRecord is one captured key exchange, tied to an AP and (when known)
+// a specific client station.
+type handshakeRecord struct {
+	APBSSID        string `json:"ap_bssid"`
+	APESSID        string `json:"ap_essid"`
+	Channel        int    `json:"channel"`
+	Encryption     string `json:"encryption"`
+	Cipher         string `json:"cipher"`
+	Authentication string `json:"authentication"`
+	APKeyMaterial  bool   `json:"ap_key_material"`
+	Station        string `json:"station"`        // client MAC, "" for an AP-level capture
+	StationVendor  string `json:"station_vendor"` // OUI vendor of the client
+	PMKID          bool   `json:"pmkid"`
+	Half           bool   `json:"half"`
+	Complete       bool   `json:"complete"`
+	Unsaved        int    `json:"unsaved"` // frames not yet flushed to the pcap
+}
+
+// handleHandshakes lists every captured handshake/PMKID derived from the live
+// WiFi state (durable, unlike the transient event stream).
+func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	recs := make([]handshakeRecord, 0)
+	for _, ap := range s.sess.WiFi.List() {
+		snap := ap.Snapshot()
+		base := handshakeRecord{
+			APBSSID:        ap.BSSID(),
+			APESSID:        ap.ESSID(),
+			Channel:        snap.Channel,
+			Encryption:     snap.Encryption,
+			Cipher:         snap.Cipher,
+			Authentication: snap.Authentication,
+			APKeyMaterial:  ap.HasKeyMaterial(),
+		}
+
+		emitted := false
+		for _, c := range ap.Clients() {
+			h := c.Handshake()
+			if h == nil || !h.Any() {
+				continue
+			}
+			cs := c.Snapshot()
+			rec := base
+			rec.Station = cs.HwAddress
+			rec.StationVendor = cs.Vendor
+			rec.PMKID = h.HasPMKID()
+			rec.Half = h.Half()
+			rec.Complete = h.Complete()
+			rec.Unsaved = h.NumUnsaved()
+			recs = append(recs, rec)
+			emitted = true
+		}
+
+		// AP-level capture (e.g. a PMKID obtained against the AP itself), or an
+		// AP flagged with key material for which we hold no live client frames.
+		aph := ap.Handshake()
+		if !emitted && ((aph != nil && aph.Any()) || ap.HasKeyMaterial()) {
+			rec := base
+			if aph != nil {
+				rec.PMKID = aph.HasPMKID()
+				rec.Half = aph.Half()
+				rec.Complete = aph.Complete()
+				rec.Unsaved = aph.NumUnsaved()
+			}
+			recs = append(recs, rec)
+		}
+	}
+
+	_, file := s.sess.Env.Get("wifi.handshakes.file")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"file":       file,
+		"count":      len(recs),
+		"handshakes": recs,
+	})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'api_client.dart';
 
@@ -40,6 +41,13 @@ class _HomePageState extends State<HomePage> {
 
   SessionInfo? _session;
   List<ApEvent> _events = const [];
+  // Handshakes are accumulated across refreshes and keyed by (AP, station):
+  // once observed they stay listed for the session, even after their event
+  // scrolls out of the fetched window. They remain stored on the backend
+  // (pcap + AP key-material flag) regardless.
+  final Map<String, HandshakeInfo> _handshakeStore = {};
+  List<HandshakeInfo> _handshakes = const [];
+  String? _handshakesFile;
   String? _error;
   int _tab = 0;
 
@@ -62,11 +70,30 @@ class _HomePageState extends State<HomePage> {
     _busy = true;
     try {
       final session = await _api.getSession();
-      final events = await _api.getEvents(n: 100);
+      final events = await _api.getEvents(n: 200);
+      final hs = await _api.getHandshakes();
       if (!mounted) return;
+
+      // merge into a persistent store keyed by (AP, station), keeping the
+      // strongest capture (PMKID > full > half). This way a handshake stays
+      // listed for the session even if its AP is later pruned by TTL.
+      for (final h in hs.items) {
+        final existing = _handshakeStore[h.key];
+        if (existing == null || h.strength >= existing.strength) {
+          _handshakeStore[h.key] = h;
+        }
+      }
+      final merged = _handshakeStore.values.toList()
+        ..sort((a, b) {
+          final byStrength = b.strength.compareTo(a.strength);
+          return byStrength != 0 ? byStrength : a.apName.compareTo(b.apName);
+        });
+
       setState(() {
         _session = session;
         _events = events.reversed.toList();
+        _handshakes = merged;
+        if (hs.file.isNotEmpty) _handshakesFile = hs.file;
         _error = null;
       });
     } catch (e) {
@@ -145,6 +172,14 @@ class _HomePageState extends State<HomePage> {
         destinations: [
           NavigationDestination(
             icon: Badge(
+              label: Text('${_handshakes.length}'),
+              isLabelVisible: _handshakes.isNotEmpty,
+              child: const Icon(Icons.vpn_key),
+            ),
+            label: 'Handshakes',
+          ),
+          NavigationDestination(
+            icon: Badge(
               label: Text('${aps.length}'),
               isLabelVisible: aps.isNotEmpty,
               child: const Icon(Icons.wifi),
@@ -194,12 +229,95 @@ class _HomePageState extends State<HomePage> {
   Widget _body(List<AccessPoint> aps) {
     switch (_tab) {
       case 1:
-        return _eventsView();
+        return _apsView(aps);
       case 2:
+        return _eventsView();
+      case 3:
         return ConsolePage(onRun: (c) => _run(c));
       default:
-        return _apsView(aps);
+        return _handshakesView(aps);
     }
+  }
+
+  Widget _handshakesView(List<AccessPoint> aps) {
+    final pmkid = _handshakes.where((h) => h.pmkid).length;
+    final full = _handshakes.where((h) => h.complete && !h.pmkid).length;
+    final half = _handshakes.where((h) => h.half && !h.complete && !h.pmkid).length;
+
+    if (_handshakes.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _refresh,
+        child: ListView(children: const [
+          SizedBox(height: 120),
+          _Empty(
+            icon: Icons.vpn_key_off,
+            text: 'Aucun handshake capturé.\n\nLance "Recon ON", puis Assoc (PMKID)\n'
+                'ou Deauth sur un réseau chiffré\npour forcer une capture.',
+          ),
+        ]),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      child: ListView(padding: const EdgeInsets.only(bottom: 24), children: [
+        _handshakeSummary(pmkid, full, half),
+        ..._handshakes.map((h) => _HandshakeCard(hs: h, onRun: _run)),
+      ]),
+    );
+  }
+
+  Widget _handshakeSummary(int pmkid, int full, int half) {
+    return Card(
+      margin: const EdgeInsets.all(12),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Icon(Icons.vpn_key, color: Colors.amberAccent),
+            const SizedBox(width: 8),
+            Text('${_handshakes.length} handshake(s)',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const Spacer(),
+            IconButton(
+              tooltip: 'Réinitialiser la liste locale (le .pcap est conservé)',
+              icon: const Icon(Icons.delete_sweep, size: 20),
+              onPressed: _handshakes.isEmpty
+                  ? null
+                  : () => setState(() {
+                        _handshakeStore.clear();
+                        _handshakes = const [];
+                      }),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          Wrap(spacing: 8, runSpacing: 6, children: [
+            _kindChip('PMKID', pmkid, Colors.amberAccent),
+            _kindChip('FULL', full, Colors.greenAccent),
+            _kindChip('HALF', half, Colors.orangeAccent),
+          ]),
+          if (_handshakesFile != null && _handshakesFile!.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Row(children: [
+              const Icon(Icons.save_alt, size: 15, color: Colors.white54),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text('pcap: ${_handshakesFile!}',
+                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+              ),
+              IconButton(
+                tooltip: 'Copier le chemin',
+                icon: const Icon(Icons.copy, size: 15),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: _handshakesFile!));
+                  _snack('Chemin copié');
+                },
+              ),
+            ]),
+          ],
+        ]),
+      ),
+    );
   }
 
   Widget _apsView(List<AccessPoint> aps) {
@@ -214,7 +332,7 @@ class _HomePageState extends State<HomePage> {
       child: ListView.builder(
         padding: const EdgeInsets.only(bottom: 24),
         itemCount: aps.length,
-        itemBuilder: (_, i) => _ApCard(ap: aps[i], onRun: _run),
+        itemBuilder: (_, i) => _ApCard(key: ValueKey(aps[i].mac), ap: aps[i], onRun: _run),
       ),
     );
   }
@@ -320,13 +438,16 @@ class _HomePageState extends State<HomePage> {
 class _ApCard extends StatelessWidget {
   final AccessPoint ap;
   final Future<void> Function(String, {String? ok}) onRun;
-  const _ApCard({required this.ap, required this.onRun});
+  const _ApCard({super.key, required this.ap, required this.onRun});
 
   @override
   Widget build(BuildContext context) {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       child: ExpansionTile(
+        // stable per-BSSID key: keeps the right network expanded when the
+        // list re-sorts by RSSI on refresh (instead of following the index).
+        key: PageStorageKey<String>(ap.mac),
         tilePadding: const EdgeInsets.symmetric(horizontal: 14),
         title: Row(children: [
           Expanded(
@@ -406,6 +527,109 @@ class _ApCard extends StatelessWidget {
       ),
     );
   }
+}
+
+Color _kindColor(String kind) {
+  switch (kind) {
+    case 'PMKID':
+      return Colors.amberAccent;
+    case 'FULL':
+      return Colors.greenAccent;
+    case 'HALF':
+      return Colors.orangeAccent;
+    default:
+      return Colors.blueGrey;
+  }
+}
+
+Widget _kindChip(String label, int count, Color color) => Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Text('$label: $count',
+          style: TextStyle(fontSize: 12, color: color, fontWeight: FontWeight.bold)),
+    );
+
+class _HandshakeCard extends StatelessWidget {
+  final HandshakeInfo hs;
+  final Future<void> Function(String, {String? ok}) onRun;
+  const _HandshakeCard({required this.hs, required this.onRun});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _kindColor(hs.kind);
+    final name = hs.apName;
+    final hasStation = hs.station.isNotEmpty && hs.station != 'ff:ff:ff:ff:ff:ff';
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(hs.kind,
+                  style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 12)),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(name,
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontStyle: hs.apHidden ? FontStyle.italic : FontStyle.normal,
+                    color: hs.apHidden ? Colors.white38 : null,
+                  ),
+                  overflow: TextOverflow.ellipsis),
+            ),
+            if (hs.channel > 0)
+              Text('CH ${hs.channel}',
+                  style: const TextStyle(fontSize: 11, color: Colors.white38)),
+          ]),
+          const SizedBox(height: 8),
+          _row(Icons.router, 'AP', hs.apBssid),
+          if (hasStation)
+            _row(Icons.smartphone, 'Station',
+                hs.stationVendor.isEmpty ? hs.station : '${hs.station}  (${hs.stationVendor})'),
+          if (hs.encryption.isNotEmpty) _row(Icons.lock, 'Chiffrement', hs.encryption),
+          if (hs.unsaved > 0) _row(Icons.sync_problem, 'Non sauvés', '${hs.unsaved} paquet(s)'),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, children: [
+            OutlinedButton.icon(
+              onPressed: () => onRun('wifi.assoc ${hs.apBssid}', ok: 'assoc → $name'),
+              icon: const Icon(Icons.key, size: 15),
+              label: const Text('Assoc (PMKID)'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => onRun('wifi.deauth ${hs.apBssid}', ok: 'deauth → $name'),
+              icon: const Icon(Icons.flash_on, size: 15),
+              label: const Text('Deauth'),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  Widget _row(IconData icon, String label, String value) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(children: [
+          Icon(icon, size: 14, color: Colors.white38),
+          const SizedBox(width: 6),
+          SizedBox(
+              width: 62,
+              child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white54))),
+          Expanded(
+              child: Text(value,
+                  style: const TextStyle(fontSize: 12), overflow: TextOverflow.ellipsis)),
+        ]),
+      );
 }
 
 Widget _chip(String text, {Color? color}) => Container(

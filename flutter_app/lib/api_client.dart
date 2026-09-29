@@ -64,6 +64,20 @@ class ApiClient {
 
   Future<void> clearEvents() => _request('DELETE', '/api/events');
 
+  /// Captured handshakes, derived from the live WiFi state on the backend
+  /// (durable — independent of the transient event stream).
+  Future<HandshakesResult> getHandshakes() async {
+    final json = await _request('GET', '/api/handshakes') as Map<String, dynamic>;
+    final items = (json['handshakes'] as List<dynamic>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(HandshakeInfo.fromJson)
+        .toList();
+    return HandshakesResult(
+      file: json['file']?.toString() ?? '',
+      items: items,
+    );
+  }
+
   void close() => _http.close(force: true);
 }
 
@@ -247,6 +261,81 @@ class ApEvent {
     if (d is Map && d['message'] != null) return d['message'].toString();
     if (d == null) return '';
     return d.toString();
+  }
+}
+
+/// Result of GET /api/handshakes: the captures plus the pcap file they go to.
+class HandshakesResult {
+  final String file;
+  final List<HandshakeInfo> items;
+  HandshakesResult({required this.file, required this.items});
+}
+
+/// A captured 802.11 key exchange, from GET /api/handshakes — tied to an AP and
+/// (when known) a client station.
+class HandshakeInfo {
+  final String apBssid;
+  final String apEssid;
+  final int channel;
+  final String encryption;
+  final bool apKeyMaterial;
+  final String station; // client MAC, "" for an AP-level capture
+  final String stationVendor;
+  final bool pmkid;
+  final bool half;
+  final bool complete;
+  final int unsaved;
+
+  HandshakeInfo({
+    required this.apBssid,
+    required this.apEssid,
+    required this.channel,
+    required this.encryption,
+    required this.apKeyMaterial,
+    required this.station,
+    required this.stationVendor,
+    required this.pmkid,
+    required this.half,
+    required this.complete,
+    required this.unsaved,
+  });
+
+  bool get apHidden => apEssid.isEmpty || apEssid == '<hidden>';
+  String get apName => apHidden ? '<hidden>' : apEssid;
+
+  /// Best-to-weakest label describing what was captured.
+  String get kind {
+    if (pmkid) return 'PMKID';
+    if (complete) return 'FULL';
+    if (half) return 'HALF';
+    return 'KEY';
+  }
+
+  /// Stable identity of a capture target (one AP/client pair).
+  String get key => '${apBssid.toLowerCase()}|${station.toLowerCase()}';
+
+  /// Higher = more useful capture (PMKID > full > half > flag only).
+  int get strength {
+    if (pmkid) return 3;
+    if (complete) return 2;
+    if (half) return 1;
+    return 0;
+  }
+
+  factory HandshakeInfo.fromJson(Map<String, dynamic> j) {
+    return HandshakeInfo(
+      apBssid: j['ap_bssid']?.toString() ?? '',
+      apEssid: j['ap_essid']?.toString() ?? '',
+      channel: (j['channel'] as num?)?.toInt() ?? 0,
+      encryption: j['encryption']?.toString() ?? '',
+      apKeyMaterial: j['ap_key_material'] == true,
+      station: j['station']?.toString() ?? '',
+      stationVendor: j['station_vendor']?.toString() ?? '',
+      pmkid: j['pmkid'] == true,
+      half: j['half'] == true,
+      complete: j['complete'] == true,
+      unsaved: (j['unsaved'] as num?)?.toInt() ?? 0,
+    );
   }
 }
 
