@@ -11,8 +11,13 @@ Petite application Flutter qui pilote le backend WiFi (`../`) via son **API HTTP
   - une carte par capture : réseau (ESSID/BSSID), station cliente (+ vendor), type, canal,
     chiffrement, paquets non sauvés ;
   - actions directes **Assoc (PMKID)** / **Deauth** pour (re)forcer une capture ;
+  - **Télécharger le .pcap** (`GET /api/handshakes/pcap`) : enregistre le fichier de captures
+    dans le dossier personnel local ;
   - accumulation en mémoire (clé = AP+station, on garde le plus fort) : une capture reste
     listée pour la session même si son AP est purgé par TTL côté backend.
+
+  > Côté backend, le serveur accumule aussi les handshakes depuis le bus d'événements,
+  > pour que le détail (PMKID/half/full + station) survive à la purge TTL des stations.
 - **Points d'accès** : liste live des APs (ESSID, BSSID, canal, RSSI coloré, chiffrement,
   nombre de clients, présence de handshake, WPS). Dépliage → clients associés + actions.
 - **Actions** (envoyées comme commandes à `POST /api/session`) :

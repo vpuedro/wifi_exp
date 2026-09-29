@@ -78,6 +78,33 @@ class ApiClient {
     );
   }
 
+  /// Downloads the captured-handshakes pcap to [savePath]. Returns the number
+  /// of bytes written.
+  Future<int> downloadPcap(String savePath) async {
+    final uri = Uri.parse('$baseUrl/api/handshakes/pcap');
+    final req = await _http.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/octet-stream');
+    if (token.isNotEmpty) req.headers.set('X-Api-Token', token);
+    final resp = await req.close();
+
+    if (resp.statusCode >= 400) {
+      final text = await resp.transform(utf8.decoder).join();
+      var msg = 'HTTP ${resp.statusCode}';
+      try {
+        final d = jsonDecode(text);
+        if (d is Map && d['error'] != null) msg = d['error'].toString();
+      } catch (_) {}
+      throw ApiException(msg, resp.statusCode);
+    }
+
+    final bytes = <int>[];
+    await for (final chunk in resp) {
+      bytes.addAll(chunk);
+    }
+    await File(savePath).writeAsBytes(bytes);
+    return bytes.length;
+  }
+
   void close() => _http.close(force: true);
 }
 
@@ -100,6 +127,8 @@ List<AccessPoint> _apsFrom(Map<String, dynamic> wifiJson) {
 class SessionInfo {
   final String name;
   final String version;
+  final String os;
+  final bool injectionSupported;
   final bool active;
   final List<ModuleInfo> modules;
   final List<AccessPoint> accessPoints;
@@ -107,6 +136,8 @@ class SessionInfo {
   SessionInfo({
     required this.name,
     required this.version,
+    required this.os,
+    required this.injectionSupported,
     required this.active,
     required this.modules,
     required this.accessPoints,
@@ -126,6 +157,9 @@ class SessionInfo {
     return SessionInfo(
       name: j['name']?.toString() ?? 'bettercap-wifi',
       version: j['version']?.toString() ?? '',
+      os: j['os']?.toString() ?? '',
+      // absent (older backend) → assume supported, don't nag
+      injectionSupported: j['injection_supported'] != false,
       active: j['active'] == true,
       modules: mods,
       accessPoints: wifi == null ? const [] : _apsFrom(wifi),

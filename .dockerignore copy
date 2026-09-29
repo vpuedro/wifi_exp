@@ -1,5 +1,0 @@
-flutter_app
-Dockerfile
-.dockerignore
-*.test
-cover.out*

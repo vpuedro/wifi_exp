@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -114,6 +115,23 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _downloadPcap() async {
+    final home = Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        Directory.systemTemp.path;
+    final remote = _handshakesFile ?? '';
+    final base = remote.isEmpty
+        ? 'bettercap-wifi-handshakes.pcap'
+        : remote.split(RegExp(r'[/\\]')).last;
+    final savePath = '$home${Platform.pathSeparator}$base';
+    try {
+      final n = await _api.downloadPcap(savePath);
+      _snack('✓ .pcap enregistré ($n octets) → $savePath');
+    } catch (e) {
+      _snack('✗ téléchargement — $e', error: true);
+    }
+  }
+
   void _snack(String msg, {bool error = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -159,6 +177,25 @@ class _HomePageState extends State<HomePage> {
                 const Icon(Icons.warning_amber, size: 18),
                 const SizedBox(width: 8),
                 Expanded(child: Text('Backend injoignable — $_error')),
+              ]),
+            ),
+          ),
+        if (_error == null && _session != null && !_session!.injectionSupported)
+          Material(
+            color: Colors.orange.shade900,
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Row(children: [
+                const Icon(Icons.block, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Injection non supportée sur le backend (${_session!.os}) : '
+                    'deauth / assoc / beacon inactifs. Seule la capture passive fonctionne. '
+                    'Utilise Linux + carte monitor pour les attaques actives.',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
               ]),
             ),
           ),
@@ -306,7 +343,7 @@ class _HomePageState extends State<HomePage> {
                     style: const TextStyle(fontSize: 11, color: Colors.white54)),
               ),
               IconButton(
-                tooltip: 'Copier le chemin',
+                tooltip: 'Copier le chemin distant',
                 icon: const Icon(Icons.copy, size: 15),
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: _handshakesFile!));
@@ -314,6 +351,15 @@ class _HomePageState extends State<HomePage> {
                 },
               ),
             ]),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                onPressed: _downloadPcap,
+                icon: const Icon(Icons.download, size: 18),
+                label: const Text('Télécharger le .pcap'),
+              ),
+            ),
           ],
         ]),
       ),

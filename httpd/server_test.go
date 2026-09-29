@@ -1,9 +1,12 @@
 package httpd
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -140,3 +143,81 @@ func TestGetHandshakes(t *testing.T) {
 
 // dynamic is a shorthand for arbitrary decoded JSON.
 type dynamic = interface{}
+
+func TestHandshakeEventAccumulationKeepsDetail(t *testing.T) {
+	sess := mockSession(t)
+	sess.WiFi.AddIfNew("WIFI_PROFESSEURS", "f0:61:c0:c6:d5:c4", 2462, -70)
+	srv := New(sess, "127.0.0.1:0", "")
+
+	// emit a handshake event (PMKID + half) for a client that is NOT tracked
+	// as a live station — the detail must still be retained.
+	sess.Events.Add("wifi.client.handshake", map[string]dynamic{
+		"file":        "/root/shakes.pcap",
+		"new_packets": 2,
+		"ap":          "f0:61:c0:c6:d5:c4",
+		"station":     "5e:bb:3d:67:94:6e",
+		"half":        true,
+		"full":        false,
+		"pmkid":       []byte{1, 2, 3, 4},
+	})
+
+	// the consumer runs asynchronously; poll until it lands.
+	var rec map[string]dynamic
+	for i := 0; i < 200; i++ {
+		w := do(t, srv.Handler(), http.MethodGet, "/api/handshakes", "", "")
+		out := map[string]dynamic{}
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		list, _ := out["handshakes"].([]dynamic)
+		for _, it := range list {
+			m := it.(map[string]dynamic)
+			if m["station"] == "5e:bb:3d:67:94:6e" {
+				rec = m
+				break
+			}
+		}
+		if rec != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec == nil {
+		t.Fatal("handshake event was not accumulated")
+	}
+	if rec["pmkid"] != true || rec["half"] != true {
+		t.Fatalf("lost detail: %v", rec)
+	}
+	if rec["ap_essid"] != "WIFI_PROFESSEURS" {
+		t.Fatalf("essid not enriched: %v", rec["ap_essid"])
+	}
+}
+
+func TestDownloadHandshakePcap(t *testing.T) {
+	sess := mockSession(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shakes.pcap")
+	content := []byte("\xd4\xc3\xb2\xa1PCAP-FAKE-BYTES")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sess.Env.Set("wifi.handshakes.file", path)
+
+	srv := New(sess, "127.0.0.1:0", "")
+
+	w := do(t, srv.Handler(), http.MethodGet, "/api/handshakes/pcap", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !bytes.Equal(w.Body.Bytes(), content) {
+		t.Fatalf("body mismatch: got %q", w.Body.Bytes())
+	}
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "shakes.pcap") {
+		t.Fatalf("Content-Disposition = %q", cd)
+	}
+
+	// missing file → 404
+	sess.Env.Set("wifi.handshakes.file", filepath.Join(dir, "nope.pcap"))
+	if w := do(t, srv.Handler(), http.MethodGet, "/api/handshakes/pcap", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("missing file status = %d, want 404", w.Code)
+	}
+}

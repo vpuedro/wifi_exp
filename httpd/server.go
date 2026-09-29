@@ -7,30 +7,50 @@ package httpd
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/bettercap/bettercap/v2/api"
 	"github.com/bettercap/bettercap/v2/core"
+
+	"github.com/evilsocket/islazy/fs"
 )
+
+// injectionSupported reports whether 802.11 frame injection (deauth, assoc,
+// beacons, probes) works on this platform. bettercap cannot inject on macOS
+// (see https://github.com/bettercap/bettercap/issues/448).
+var injectionSupported = runtime.GOOS != "darwin"
 
 type Server struct {
 	sess  *api.Session
 	token string
 	http  *http.Server
 	runMu sync.Mutex
+
+	// durable handshake registry, keyed by "apBSSID|station", fed from the
+	// event bus so full capture detail (PMKID/half/full) survives even after
+	// the client station is pruned from the live WiFi state by TTL.
+	hsMu    sync.RWMutex
+	hsStore map[string]handshakeRecord
 }
 
 // New builds the HTTP server. When token is non-empty every request must carry
 // it in the X-Api-Token header (or Authorization: Bearer <token>).
 func New(sess *api.Session, address, token string) *Server {
-	s := &Server{sess: sess, token: token}
+	s := &Server{sess: sess, token: token, hsStore: map[string]handshakeRecord{}}
+
+	go s.consumeHandshakeEvents()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/session", s.auth(s.handleSession))
 	mux.HandleFunc("/api/wifi", s.auth(s.handleWiFi))
 	mux.HandleFunc("/api/handshakes", s.auth(s.handleHandshakes))
+	mux.HandleFunc("/api/handshakes/pcap", s.auth(s.handleHandshakePcap))
 	mux.HandleFunc("/api/events", s.auth(s.handleEvents))
 	mux.HandleFunc("/api/env", s.auth(s.handleEnv))
 
@@ -80,13 +100,16 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"name":       core.Name + "-wifi",
-			"version":    core.Version,
-			"started_at": s.sess.StartedAt,
-			"active":     s.sess.Active,
-			"interface":  s.sess.Interface,
-			"modules":    s.sess.Modules,
-			"wifi":       s.sess.WiFi,
+			"name":                core.Name + "-wifi",
+			"version":             core.Version,
+			"os":                  runtime.GOOS,
+			"arch":                runtime.GOARCH,
+			"injection_supported": injectionSupported,
+			"started_at":          s.sess.StartedAt,
+			"active":              s.sess.Active,
+			"interface":           s.sess.Interface,
+			"modules":             s.sess.Modules,
+			"wifi":                s.sess.WiFi,
 		})
 
 	case http.MethodPost:
@@ -137,15 +160,104 @@ type handshakeRecord struct {
 	Unsaved        int    `json:"unsaved"` // frames not yet flushed to the pcap
 }
 
-// handleHandshakes lists every captured handshake/PMKID derived from the live
-// WiFi state (durable, unlike the transient event stream).
+func recordKey(bssid, station string) string {
+	return strings.ToLower(bssid) + "|" + strings.ToLower(station)
+}
+
+func (r handshakeRecord) key() string { return recordKey(r.APBSSID, r.Station) }
+
+// strength ranks how useful a capture is: PMKID > full > half > flag only.
+func (r handshakeRecord) strength() int {
+	switch {
+	case r.PMKID:
+		return 3
+	case r.Complete:
+		return 2
+	case r.Half:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// consumeHandshakeEvents accumulates wifi.client.handshake events into hsStore,
+// so full detail (PMKID/half/full, station) is retained beyond station TTL.
+func (s *Server) consumeHandshakeEvents() {
+	for e := range s.sess.Events.Listen() {
+		if e.Tag != "wifi.client.handshake" {
+			continue
+		}
+		// the event payload is a module struct; round-trip through JSON to read
+		// it without importing the wifi module.
+		raw, err := json.Marshal(e.Data)
+		if err != nil {
+			continue
+		}
+		var he struct {
+			File       string `json:"file"`
+			NewPackets int    `json:"new_packets"`
+			AP         string `json:"ap"`
+			Station    string `json:"station"`
+			Half       bool   `json:"half"`
+			Full       bool   `json:"full"`
+			PMKID      []byte `json:"pmkid"`
+		}
+		if json.Unmarshal(raw, &he) != nil || he.AP == "" {
+			continue
+		}
+
+		rec := handshakeRecord{
+			APBSSID:       he.AP,
+			Station:       he.Station,
+			APKeyMaterial: true,
+			PMKID:         len(he.PMKID) > 0,
+			Half:          he.Half,
+			Complete:      he.Full,
+		}
+		// enrich with AP identity from the live state (present at capture time).
+		if ap, ok := s.sess.WiFi.Get(he.AP); ok {
+			snap := ap.Snapshot()
+			rec.APESSID = ap.ESSID()
+			rec.Channel = snap.Channel
+			rec.Encryption = snap.Encryption
+			rec.Cipher = snap.Cipher
+			rec.Authentication = snap.Authentication
+		}
+		if st, ok := s.sess.WiFi.GetClient(he.Station); ok {
+			rec.StationVendor = st.Snapshot().Vendor
+		}
+
+		s.hsMu.Lock()
+		if prev, ok := s.hsStore[rec.key()]; !ok || rec.strength() >= prev.strength() {
+			// keep the essid/channel we already knew if this event couldn't resolve it
+			if rec.APESSID == "" {
+				rec.APESSID = prev.APESSID
+			}
+			s.hsStore[rec.key()] = rec
+		}
+		s.hsMu.Unlock()
+	}
+}
+
+// handleHandshakes lists every captured handshake, merging the durable event
+// registry (full detail) with the live WiFi state (fills APs flagged with key
+// material for which we hold no captured event, e.g. after an import).
 func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
 
-	recs := make([]handshakeRecord, 0)
+	merged := map[string]handshakeRecord{}
+
+	// 1) durable, detailed records from the event registry.
+	s.hsMu.RLock()
+	for k, v := range s.hsStore {
+		merged[k] = v
+	}
+	s.hsMu.RUnlock()
+
+	// 2) live WiFi state — add anything not already covered.
 	for _, ap := range s.sess.WiFi.List() {
 		snap := ap.Snapshot()
 		base := handshakeRecord{
@@ -172,12 +284,12 @@ func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
 			rec.Half = h.Half()
 			rec.Complete = h.Complete()
 			rec.Unsaved = h.NumUnsaved()
-			recs = append(recs, rec)
+			if prev, ok := merged[rec.key()]; !ok || rec.strength() > prev.strength() {
+				merged[rec.key()] = rec
+			}
 			emitted = true
 		}
 
-		// AP-level capture (e.g. a PMKID obtained against the AP itself), or an
-		// AP flagged with key material for which we hold no live client frames.
 		aph := ap.Handshake()
 		if !emitted && ((aph != nil && aph.Any()) || ap.HasKeyMaterial()) {
 			rec := base
@@ -187,8 +299,15 @@ func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
 				rec.Complete = aph.Complete()
 				rec.Unsaved = aph.NumUnsaved()
 			}
-			recs = append(recs, rec)
+			if _, ok := merged[rec.key()]; !ok {
+				merged[rec.key()] = rec
+			}
 		}
+	}
+
+	recs := make([]handshakeRecord, 0, len(merged))
+	for _, v := range merged {
+		recs = append(recs, v)
 	}
 
 	_, file := s.sess.Env.Get("wifi.handshakes.file")
@@ -197,6 +316,52 @@ func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
 		"count":      len(recs),
 		"handshakes": recs,
 	})
+}
+
+// handleHandshakePcap streams the captured-handshakes pcap for download. The
+// path comes solely from the wifi.handshakes.file setting (no client-supplied
+// path), so there is no traversal surface.
+func (s *Server) handleHandshakePcap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	_, raw := s.sess.Env.Get("wifi.handshakes.file")
+	if raw == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no handshakes file configured"})
+		return
+	}
+	path, err := fs.Expand(raw)
+	if err != nil {
+		path = raw
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound,
+			map[string]string{"error": "handshakes file not found (nothing captured yet?): " + path})
+		return
+	}
+	if info.IsDir() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "handshakes are stored per-network (wifi.handshakes.aggregate=false); " +
+				"single-file (aggregate) mode is required to download",
+		})
+		return
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer f.Close()
+
+	name := filepath.Base(path)
+	w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
